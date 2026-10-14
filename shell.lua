@@ -8,6 +8,8 @@ fonts { "Noto Sans" }
 
 local VISIT_MIN, VISIT_MAX = 20000, 90000 -- ms hidden between visits
 local GAP_MIN, GAP_MAX = 2500, 6500 -- ms between antics
+local STAY_MIN, STAY_MAX = 4000, 8000 -- ms on the floor after a throw before it leaves
+local SLEEP_MS = 25000 -- asleep this long unless poked, then it tucks itself away
 local WALK_SPEED, STEP_MS = 140, 210 -- px/s along the floor, ms a step
 
 math.randomseed(os.time())
@@ -864,8 +866,7 @@ local function play(name)
         if name == "sleep" then
             asleep:set(true)
             mood:set("sleep")
-            -- Asleep until poked, or 25 s, then it tucks itself away.
-            later(25000, function()
+            later(SLEEP_MS, function()
                 asleep:set(false)
                 mood:set("normal")
                 leave()
@@ -1055,7 +1056,7 @@ local function thrown(f)
     mood:set(woozy and "dizzy" or "normal")
     later(woozy and 1400 or 1, function() mood:set("normal") end)
     if math.random() < 0.6 then later(woozy and 900 or 250, function() speak(THROWN_LINES[math.random(#THROWN_LINES)]) end) end
-    later(math.random(4000, 8000), leave)
+    later(math.random(STAY_MIN, STAY_MAX), leave)
 end
 
 local function drag(_, local_pt, phase, _, velocity)
