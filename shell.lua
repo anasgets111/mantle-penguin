@@ -28,7 +28,9 @@ local bubble_on = state("mascot_bubble", false)
 local rest = state("mascot_rest", false) -- false until placed on the floor
 local grab = state("mascot_grab", false)
 local tilt = state("mascot_tilt", 0)
-local phys = state("mascot_phys", "drag") -- spring set: drag, coast, fall
+local phys = state("mascot_phys", "drag") -- motion set: drag, walk, coast, fall, or throw
+local flight = state("mascot_flight", false) -- a throw's keyframes, while `phys` is "throw"
+local air = state("mascot_air", false) -- thrown and not yet down
 local squish = state("mascot_squish", { x = 1, y = 1 })
 local mood = state("mascot_mood", "normal")
 local antic = state("mascot_antic", "")
@@ -54,13 +56,19 @@ end
 
 -- Timers ----------------------------------------------------------------------------------------
 
--- Everything an antic or a landing arms goes here, so a grab can cancel it all.
-local pending = {}
-local function later(ms, fn) pending[#pending + 1] = timer(math.max(1, ms), fn) end
-local function cancel_pending()
-    for _, h in ipairs(pending) do h:cancel() end
-    pending = {}
+-- Timers in a bucket that can be cancelled together.
+local function bucket()
+    local list = {}
+    return function(ms, fn) list[#list + 1] = timer(math.max(1, ms), fn) end,
+        function()
+            for _, h in ipairs(list) do h:cancel() end
+            list = {}
+        end
 end
+-- `later`: an antic's steps and the visit's plan, which a poke or a grab replaces. `in_flight`: a
+-- throw's landing, which only a grab or the end of the visit cuts short.
+local later, cancel_pending = bucket()
+local in_flight, cancel_flight = bucket()
 
 -- Keyframe helpers ------------------------------------------------------------------------------
 
@@ -334,8 +342,122 @@ local function reset()
     phys:set("drag")
     tilt:set(0)
     squish:set(T(1, 1))
+    air:set(false)
 end
 reset()
+
+-- Throw: a projectile under gravity, played as keyframes -------------------------------------------
+
+local GRAVITY = 3200 -- px/s²
+local THROW_MAX = 3200 -- px/s, the fastest flick it keeps
+local WALL_KEEP = 0.5 -- share of the speed kept off a side wall
+local BOUNCE_KEEP = 0.12 -- share of the fall's energy bounced back up
+local SLIDE = 0.12 -- s of its landing speed it slides on
+local TURN_SPEED = 1600 -- px/s of sideways flick per somersault
+local SQUASH_MS = 70
+
+local function ms(t) return math.max(1, math.floor(t * 1000 + 0.5)) end
+
+-- A stretch of parabola as a CSS bezier. `a` is the start speed times the duration over the distance:
+-- 0 starts from rest, 2 ends at rest.
+local function arc(a) return { 1 / 3, a / 3, 2 / 3, (a + 1) / 3 } end
+
+-- Keyframes per axis for a release at (x, y) with velocity (vx, vy), its tilt `turn` at release.
+local function flight_path(x, y, vx, vy, turn, s)
+    local floor, right = floor_y(s), math.max(EDGE, s.width - W - EDGE)
+    vx, vy = clamp(vx, -THROW_MAX, THROW_MAX), clamp(vy, -THROW_MAX, THROW_MAX)
+
+    local ys, t_air, impact = { T(0, y) }, 0, 0
+    if vy < 0 then
+        -- Up to an apex that stays on screen.
+        vy = math.max(vy, -math.sqrt(2 * GRAVITY * math.max(0, y - EDGE)))
+        local t = -vy / GRAVITY
+        y = y - vy * vy / (2 * GRAVITY)
+        ys[#ys + 1] = { value = T(0, y), duration = ms(t), easing = arc(2) }
+        t_air, vy = t, 0
+    end
+    local h = floor - y
+    if h > 1 then
+        local t = (math.sqrt(vy * vy + 2 * GRAVITY * h) - vy) / GRAVITY
+        ys[#ys + 1] = { value = T(0, floor), duration = ms(t), easing = arc(vy * t / h) }
+        t_air, impact = t_air + t, vy + GRAVITY * t
+    else
+        -- Let go below the floor: it steps back up.
+        ys[#ys + 1] = { value = T(0, floor), duration = 160, easing = "out_back" }
+        t_air = t_air + 0.16
+    end
+    local t_after = 0.25
+    local hop = math.min(60, BOUNCE_KEEP * impact * impact / (2 * GRAVITY))
+    if hop >= 4 then
+        local t = math.sqrt(2 * hop / GRAVITY)
+        ys[#ys + 1] = { value = T(0, floor), duration = SQUASH_MS }
+        ys[#ys + 1] = { value = T(0, floor - hop), duration = ms(t), easing = arc(2) }
+        ys[#ys + 1] = { value = T(0, floor), duration = ms(t), easing = arc(0) }
+        t_after = SQUASH_MS / 1000 + 2 * t
+    end
+
+    -- Sideways at a constant speed, off the walls, then a short slide.
+    local xs, v, t = { T(x, 0) }, vx, 0
+    for _ = 1, 8 do
+        if t >= t_air then break end
+        local wall = v > 0 and right or v < 0 and EDGE or nil
+        local hit = wall and (wall - x) / v
+        if hit and hit <= 0 then
+            v = -v * WALL_KEEP -- let go past that wall: back it comes
+        elseif hit and t + hit < t_air then
+            x, t, v = wall, t + hit, -v * WALL_KEEP
+            xs[#xs + 1] = { value = T(x, 0), duration = ms(hit), easing = "linear" }
+        else
+            x = x + v * (t_air - t)
+            xs[#xs + 1] = { value = T(x, 0), duration = ms(t_air - t), easing = "linear" }
+            t = t_air
+        end
+    end
+    local x_end = clamp(x + v * SLIDE, EDGE, right)
+    xs[#xs + 1] = { value = T(x_end, 0), duration = ms(t_after), easing = "out_quad" }
+
+    -- A hard sideways flick somersaults it, upright again at touchdown.
+    local turns = math.min(2, math.floor(math.abs(vx) / TURN_SPEED))
+    local rs = { turn }
+    if turns > 0 and t_air > 0.3 then
+        rs[2] = { value = (vx > 0 and 360 or -360) * turns, duration = ms(t_air), easing = "in_out_sine" }
+        rs[3] = { value = 0, duration = 0 }
+    else
+        rs[2] = { value = 0, duration = 260, easing = "out_back" }
+    end
+
+    return {
+        motion = {
+            x = { duration = 100, keyframes = xs },
+            y = { duration = 100, keyframes = ys },
+            rotate = { duration = 100, keyframes = rs },
+        },
+        rest = { x = x_end, y = floor },
+        contact = ms(t_air),
+        total = ms(t_air + t_after),
+        impact = impact,
+        turns = turns,
+    }
+end
+
+-- Throws from (x, y); `landed(path)` runs once it has settled.
+local function throw(x, y, vx, vy, turn, landed)
+    local f = flight_path(x, y, vx, vy, turn, screen:get())
+    flight:set(f.motion)
+    phys:set("throw")
+    rest:set(f.rest)
+    air:set(true)
+    in_flight(f.contact, function()
+        air:set(false)
+        squish:set(T(1.3, 0.72))
+        in_flight(SQUASH_MS + 60, function() squish:set(T(0.92, 1.1)) end)
+        in_flight(SQUASH_MS + 240, function() squish:set(T(1, 1)) end)
+    end)
+    in_flight(f.total, function()
+        phys:set("fall")
+        if landed then landed(f) end
+    end)
+end
 
 -- A visit: appear, one to three antics, leave ------------------------------------------------------
 
@@ -410,6 +532,7 @@ end
 
 local function hide()
     cancel_pending()
+    cancel_flight()
     out, leaving, on_done = false, false, nil
     reset()
     schedule_visit()
@@ -447,7 +570,8 @@ local function enter(tries)
         return hide()
     end
     local fy = floor_y(s)
-    if math.random() < 0.5 then
+    local how = math.random()
+    if how < 0.4 then
         -- Waddle in from a side, placed off-screen first.
         local from_left = math.random() < 0.5
         local tx = from_left and math.random(80, 400) or s.width - W - math.random(80, 400)
@@ -458,7 +582,7 @@ local function enter(tries)
             play("walk")
             on_done = arrived
         end)
-    else
+    elseif how < 0.8 then
         -- Peek over the bottom edge, look around, then climb up.
         local x = math.random(EDGE, s.width - W - EDGE)
         phys:set("coast")
@@ -473,6 +597,15 @@ local function enter(tries)
                     later(900, arrived)
                 end
             end)
+        end)
+    else
+        -- Drop in from above the top edge.
+        local x, y = math.random(EDGE, s.width - W - EDGE), -H - 40
+        phys:set("drag")
+        rest:set({ x = x, y = y })
+        later(60, function()
+            mood:set("surprised")
+            throw(x, y, 0, 0, 0, function() later(400, arrived) end)
         end)
     end
 end
@@ -506,16 +639,21 @@ local function stop(local_pt)
     end
 end
 
--- Grab, throw, land ---------------------------------------------------------------------------------
+-- Grab and throw ------------------------------------------------------------------------------------
+
+local THROWN_LINES = {
+    "I can fly!", "again! again!", "10/10, would fly again", "my lawyer will hear about this",
+    "was that necessary?", "I regret nothing", "stuck the landing.", "penguins can't fly. I checked.",
+}
 
 local moved = false
 
-local function land()
-    squish:set(T(1.32, 0.68))
-    later(130, function() squish:set(T(0.92, 1.1)) end)
-    later(300, function() squish:set(T(1, 1)) end)
-    later(700, function() mood:set("normal") end)
-    -- Settled: it stays a few seconds, then leaves.
+-- Down after a throw: it shakes it off, may comment, and leaves a few seconds later.
+local function thrown(f)
+    local woozy = f.turns > 0 or f.impact > 3000
+    mood:set(woozy and "dizzy" or "normal")
+    later(woozy and 1400 or 1, function() mood:set("normal") end)
+    if math.random() < 0.6 then later(woozy and 900 or 250, function() speak(THROWN_LINES[math.random(#THROWN_LINES)]) end) end
     later(math.random(4000, 8000), leave)
 end
 
@@ -525,10 +663,12 @@ local function drag(_, local_pt, phase, _, velocity)
         moved = false
         if not p then return end
         stop()
+        cancel_flight()
         out = true
         local r = drawn_at(local_pt)
         local was_asleep = asleep:get()
         asleep:set(false)
+        air:set(false)
         phys:set("drag")
         grab:set({ px = p.x, py = p.y, ox = r.x, oy = r.y })
         squish:set(T(0.94, 1.08))
@@ -547,34 +687,20 @@ local function drag(_, local_pt, phase, _, velocity)
         tilt:set(clamp(velocity.x / 90, -28, 28))
         return
     end
-    -- End. A press without motion is a click; on_click follows.
+    -- End. A press without motion is a click, and on_click follows.
     local here = p and { x = g.ox + p.x - g.px, y = g.oy + p.y - g.py } or { x = g.ox, y = g.oy }
-    local s = screen:get()
+    local turn = tilt:get()
     grab:set(false)
     tilt:set(0)
-    if not moved then
-        rest:set({ x = g.ox, y = g.oy })
-        squish:set(T(1, 1))
-        mood:set("normal")
-        return
-    end
-    local x = clamp(here.x + velocity.x * 0.18, EDGE, math.max(EDGE, s.width - W - EDGE))
-    local y = clamp(here.y + velocity.y * 0.12, EDGE, floor_y(s))
     squish:set(T(1, 1))
-    mood:set("surprised")
-    if floor_y(s) - y > 6 then
-        -- Coast to the end of the throw on a soft spring, then fall.
-        phys:set("coast")
-        rest:set({ x = x, y = y })
-        later(420, function()
-            phys:set("fall")
-            rest:set({ x = x, y = floor_y(s) })
-            later(210, land)
-        end)
+    if moved then
+        mood:set("surprised")
+        throw(here.x, here.y, velocity.x, velocity.y, turn, thrown)
+    elseif here.y < floor_y(screen:get()) - 2 then
+        throw(here.x, here.y, 0, 0, turn) -- caught mid-air and let go: it drops
     else
-        phys:set("fall")
-        rest:set({ x = x, y = floor_y(s) })
-        later(210, land)
+        rest:set(here)
+        mood:set("normal")
     end
 end
 
@@ -918,7 +1044,7 @@ local ground = rect {
     align_h = "center",
     align_v = "end",
     background = "#00000040",
-    opacity = grab:map(function(g) return g and 0.35 or 1 end),
+    opacity = computed({ grab, air }, function(g, a) return (g or a) and 0 or 1 end),
     scale = T(1, 1),
     animate = track("ground", { opacity = 200 }),
 }
@@ -1040,12 +1166,14 @@ local speech = rect {
     end),
 }
 
-local motion = phys:map(function(p)
-    if p == "drag" then return { translate = SPRING(520, 34), rotate = SPRING(260, 12) } end
-    if p == "walk" then return { translate = SPRING(12, 7), rotate = SPRING(120, 8) } end
-    if p == "coast" then return { translate = SPRING(70, 15), rotate = SPRING(120, 8) } end
-    return { translate = SPRING(260, 12), rotate = SPRING(200, 9) }
-end)
+-- Each axis and the tilt has its own entry, so a throw's rise, fall and drift each keep their curve.
+local MOTION = {
+    drag = { x = SPRING(520, 34), y = SPRING(520, 34), rotate = SPRING(260, 16) },
+    walk = { x = SPRING(12, 7), y = SPRING(12, 7), rotate = SPRING(120, 8) },
+    coast = { x = SPRING(70, 15), y = SPRING(70, 15), rotate = SPRING(120, 8) },
+    fall = { x = SPRING(260, 12), y = SPRING(260, 12), rotate = SPRING(200, 9) },
+}
+local motion = computed({ phys, flight }, function(p, f) return p == "throw" and f or MOTION[p] end)
 
 schedule_visit()
 
@@ -1066,10 +1194,25 @@ return {
                     width = W,
                     height = H,
                     visible = rest:map(function(r) return r ~= false end),
-                    translate = pos,
-                    rotate = tilt,
-                    animate = motion,
-                    children = { ground, spin, speech },
+                    translate = pos:map(function(p) return T(p.x, 0) end),
+                    animate = motion:map(function(m) return { translate = m.x } end),
+                    children = { rect {
+                        width = W,
+                        height = H,
+                        translate = pos:map(function(p) return T(0, p.y) end),
+                        animate = motion:map(function(m) return { translate = m.y } end),
+                        children = {
+                            ground,
+                            rect {
+                                width = W,
+                                height = H,
+                                rotate = tilt,
+                                animate = motion:map(function(m) return { rotate = m.rotate } end),
+                                children = { spin },
+                            },
+                            speech,
+                        },
+                    } },
                 },
             },
         },
