@@ -17,10 +17,11 @@ local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
 -- Size of the mascot's box, and the gap it keeps from the screen edge.
 local W, H, EDGE, FLOOR_GAP = 104, 112, 8, 20
 
-local BODY_TOP, BODY_BOT = "#3D4A6E", "#1C2236"
-local PATCH = "#FFF9F3" -- face patch; the eyelids match it
-local DARK, BELLY = "#10131A", "#E6EBF5"
-local BEAK, BEAK_D = "#FF9E2C", "#D9701A"
+-- Tux colours: glossy black, white eye patches and belly, a gold beak and feet.
+local BODY_TOP, BODY_BOT = "#3C3C44", "#09090C"
+local PATCH, LID, DARK = "#FFFFFF", "#ECEDF1", "#0B0B0E"
+local BEAK, BEAK_D = "#F2C230", "#B07A06"
+local FOOT_TOP, FOOT_BOT = "#F7CF2A", "#C99606"
 
 -- State -----------------------------------------------------------------------------------------
 
@@ -1167,21 +1168,22 @@ end)
 -- Moods ---------------------------------------------------------------------------------------
 
 -- top/bot: eyelid height in px of the 20 px eye. es/ps: eye and pupil scale.
+-- br/by: brow tilt (inner end down, degrees) and lift (px, up is negative).
 local MOODS = {
-    normal = { top = 0, bot = 0, es = 1, ps = 1, mouth = "smile", cheek = 0.5 },
-    surprised = { top = 0, bot = 0, es = 1.25, ps = 0.55, mouth = "o", cheek = 0.3 },
-    happy = { top = 0, bot = 13, es = 1, ps = 1, mouth = "grin", cheek = 1 },
-    sleep = { top = 20, bot = 0, es = 1, ps = 1, mouth = "flat", cheek = 0.4 },
-    sleepy = { top = 10, bot = 0, es = 1, ps = 1, mouth = "flat", cheek = 0.4 },
-    yawn = { top = 15, bot = 0, es = 1, ps = 1, mouth = "yawn", cheek = 0.5 },
-    sneeze = { top = 20, bot = 0, es = 1, ps = 1, mouth = "sneeze", cheek = 0.5 },
-    dizzy = { top = 0, bot = 0, es = 1.1, ps = 0.4, mouth = "wobble", cheek = 0.5 },
-    bored = { top = 8, bot = 0, es = 1, ps = 1, mouth = "flat", cheek = 0.3 },
-    cold = { top = 5, bot = 0, es = 0.92, ps = 1, mouth = "wobble", cheek = 0.1 },
-    think = { top = 7, bot = 0, es = 1, ps = 0.85, mouth = "flat", cheek = 0.4 },
-    effort = { top = 9, bot = 5, es = 1, ps = 1, mouth = "flat", cheek = 1 },
-    smug = { top = 9, bot = 0, es = 1, ps = 1, mouth = "grin", cheek = 0.8 },
-    sing = { top = 0, bot = 13, es = 1, ps = 1, mouth = "o", cheek = 0.9 },
+    normal = { top = 0, bot = 0, es = 1, ps = 1, mouth = "smile", cheek = 0.5, br = 0, by = 0 },
+    surprised = { top = 0, bot = 0, es = 1.25, ps = 0.55, mouth = "o", cheek = 0.3, br = -6, by = -5 },
+    happy = { top = 0, bot = 13, es = 1, ps = 1, mouth = "grin", cheek = 1, br = -4, by = -3 },
+    sleep = { top = 20, bot = 0, es = 1, ps = 1, mouth = "flat", cheek = 0.4, br = 0, by = 2 },
+    sleepy = { top = 10, bot = 0, es = 1, ps = 1, mouth = "flat", cheek = 0.4, br = -8, by = 1 },
+    yawn = { top = 15, bot = 0, es = 1, ps = 1, mouth = "yawn", cheek = 0.5, br = -6, by = 0 },
+    sneeze = { top = 20, bot = 0, es = 1, ps = 1, mouth = "sneeze", cheek = 0.5, br = 10, by = 3 },
+    dizzy = { top = 0, bot = 0, es = 1.1, ps = 0.4, mouth = "wobble", cheek = 0.5, br = -12, by = -1 },
+    bored = { top = 8, bot = 0, es = 1, ps = 1, mouth = "flat", cheek = 0.3, br = 4, by = 3 },
+    cold = { top = 5, bot = 0, es = 0.92, ps = 1, mouth = "wobble", cheek = 0.1, br = -14, by = -2 },
+    think = { top = 7, bot = 0, es = 1, ps = 0.85, mouth = "flat", cheek = 0.4, br = 8, by = 1 },
+    effort = { top = 9, bot = 5, es = 1, ps = 1, mouth = "flat", cheek = 1, br = 16, by = 3 },
+    smug = { top = 9, bot = 0, es = 1, ps = 1, mouth = "grin", cheek = 0.8, br = 10, by = 1 },
+    sing = { top = 0, bot = 13, es = 1, ps = 1, mouth = "o", cheek = 0.9, br = -6, by = -3 },
 }
 
 -- A mouth is always M, Q, Q, Z so one shape morphs into the next point by point.
@@ -1205,6 +1207,8 @@ local MOUTHS = {
 
 local function of(key) return mood:map(function(m) return MOODS[m][key] end) end
 local lid_top, lid_bot, eye_scale, pupil_scale, cheek = of("top"), of("bot"), of("es"), of("ps"), of("cheek")
+local EYE_H = 30
+local LID_PX = EYE_H / 20 -- mood lids are in px of a 20 px eye
 local mouth_shape = mood:map(function(m) return MOUTHS[MOODS[m].mouth] end)
 
 -- Antic tracks: a layer's base motion, overridden by the running antic's keyframes ------------------
@@ -1224,61 +1228,99 @@ local SPRING = function(k, d) return { spring = { stiffness = k, damping = d } }
 
 -- Pieces ----------------------------------------------------------------------------------------
 
-local BLINK = { -- one blink every 3.8 s; the hold between asks for no frames
+-- One blink every 3.8 s: a lid slides down over the patch and back. The hold asks for no frames.
+local BLINK = {
     duration = 100,
     loops = "infinite",
     keyframes = {
-        T(1, 1),
-        { value = T(1, 1), duration = 3600 },
-        { value = T(1, 0.1), duration = 70 },
-        { value = T(1, 1), duration = 120 },
+        T(0, -EYE_H - 2),
+        { value = T(0, -EYE_H - 2), duration = 3600 },
+        { value = T(0, 0), duration = 70 },
+        { value = T(0, -EYE_H - 2), duration = 120 },
     },
 }
 
 local pupil_anim = track("pupil", { translate = SPRING(260, 20), scale = SPRING(400, 24) })
 
-local function eye()
+local function lid_edge() return rect { width = "fill", height = 2.5, align_v = "end", background = DARK } end
+
+-- A big white patch with a small black pupil looking slightly inward, as on Tux. `side`: 1 left, -1 right.
+local function eye(side)
     return rect {
-        width = 15,
-        height = 20,
-        radius = 8,
+        width = 24,
+        height = EYE_H,
+        radius = 999,
         clip = "rounded",
-        background = DARK,
+        background = { gradient = "radial", stops = { { 0, PATCH }, { 0.7, "#F2F3F6" }, { 1, "#BFC2CC" } } },
         scale = eye_scale:map(function(s) return T(s, s) end),
         animate = { scale = SPRING(500, 16) },
         children = {
-            rect { width = 3, height = 3, radius = 2, background = "#FFFFFFB0", align_h = "center", align_v = "end", margin = { bottom = 3, left = 4 } },
             rect {
-                width = 7,
-                height = 7,
-                radius = 4,
-                background = "#FFFFFF",
+                width = 9,
+                height = 11,
+                radius = 999,
+                background = DARK,
                 align_h = "center",
-                align_v = "start",
-                margin = { top = 3 },
+                align_v = "center",
+                margin = side > 0 and { left = 7, top = 4 } or { right = 7, top = 4 },
                 translate = look,
                 scale = pupil_scale:map(function(s) return T(s, s) end),
                 animate = pupil_anim,
+                children = { rect { width = 3, height = 3, radius = 2, background = "#FFFFFF", margin = { top = 2, left = 2 } } },
             },
-            rect { width = 15, height = lid_top, background = PATCH, align_v = "start", animate = { height = 110 } },
-            rect { width = 19, height = lid_bot, radius = 999, background = PATCH, align_v = "end", align_h = "center", animate = { height = 110 } },
+            rect {
+                width = "fill",
+                height = lid_top:map(function(h) return h * LID_PX end),
+                background = LID,
+                animate = { height = 110 },
+                children = { lid_edge() },
+            },
+            rect {
+                width = 30,
+                height = lid_bot:map(function(h) return h * LID_PX end),
+                radius = 999,
+                background = LID,
+                border_width = 2.5,
+                border_color = DARK,
+                align_h = "center",
+                align_v = "end",
+                margin = { bottom = -2 },
+                animate = { height = 110 },
+            },
+            rect { width = "fill", height = EYE_H, background = LID, translate = T(0, -EYE_H - 2), animate = { translate = BLINK }, children = { lid_edge() } },
         },
     }
 end
 
--- A flipper hangs angled out from its shoulder; antics turn it from there.
+-- A heavy brow over each patch; moods tilt and lift it.
+local function brow(side)
+    return path {
+        width = 26,
+        height = 10,
+        origin = { x = 0.5, y = 1 },
+        stroke = DARK,
+        stroke_width = 4,
+        stroke_cap = "round",
+        commands = { { op = "M", points = { 3, 8 } }, { op = "Q", points = { 13, 0, 23, 8 } } },
+        rotate = mood:map(function(m) return side * MOODS[m].br end),
+        translate = mood:map(function(m) return T(0, MOODS[m].by) end),
+        animate = { rotate = SPRING(300, 18), translate = SPRING(300, 18) },
+    }
+end
+
+-- A short flipper angled out and down from its shoulder, with a grey sheen; antics turn it from there.
 local function arm(side, part)
     return rect {
-        width = 13,
-        height = 34,
+        width = 14,
+        height = 36,
         origin = { x = 0.5, y = 0.1 },
-        rotate = side * 10,
+        rotate = side * 28,
         children = { rect {
-            width = 13,
-            height = 34,
-            radius = { top_left = 7, top_right = 7, bottom_right = 11, bottom_left = 11 },
+            width = 14,
+            height = 36,
+            radius = { top_left = 7, top_right = 7, bottom_right = 9, bottom_left = 9 },
             origin = { x = 0.5, y = 0.1 },
-            background = { gradient = "linear", angle = 180, stops = { { 0, BODY_TOP }, { 1, BODY_BOT } } },
+            background = { gradient = "linear", angle = side > 0 and 100 or 260, stops = { { 0, "#6A6A74" }, { 0.45, "#1A1A20" }, { 1, BODY_BOT } } },
             rotate = side * 8,
             animate = track(part, {}),
         } },
@@ -1287,10 +1329,11 @@ end
 
 local function foot(swing, part)
     return rect {
-        width = 22,
-        height = 10,
-        radius = { top_left = 6, top_right = 6, bottom_right = 5, bottom_left = 5 },
-        background = BEAK,
+        width = 39,
+        height = 16,
+        radius = 999,
+        background = { gradient = "linear", angle = 180, stops = { { 0, FOOT_TOP }, { 1, FOOT_BOT } } },
+        children = { rect { width = 24, height = 7, radius = 999, align_h = "center", margin = { top = 2 }, background = "#FFE680" } },
         origin = { x = 0.5, y = 0 },
         rotate = tilt:map(function(t) return swing * t * 0.9 end),
         translate = grab:map(function(g) return T(0, g and 5 or 0) end),
@@ -1309,59 +1352,51 @@ local function cheek_dot()
     }
 end
 
-local function tuft(angle, h)
-    return rect { width = 5, height = h, radius = 3, rotate = angle, origin = { x = 0.5, y = 1 }, background = BODY_TOP }
-end
-
 local function circle(cx, cy, r) return { left = cx - r, top = cy - r, right = cx + r, bottom = cy + r, radius = 999 } end
 
--- A chick-shaped penguin: a round head melted into a wider, egg-shaped body, and a white front whose
--- heart-shaped face runs down into the belly, as on an emperor chick.
+-- Tux-shaped: a glossy black egg, wider at the bottom, a big white belly, two white eye patches that
+-- touch under heavy brows, and a chunky gold beak over them.
 local body = rect {
-    width = 84,
-    height = 82,
+    width = 88,
+    height = 92,
     align_h = "center",
     align_v = "end",
-    margin = { bottom = 11 },
-    shape = { melt = 14, parts = { circle(42, 35, 35), { left = 0, top = 36, right = 84, bottom = 82, radius = 40 } } },
-    background = { gradient = "linear", angle = 180, stops = { { 0, BODY_TOP }, { 1, BODY_BOT } } },
+    margin = { bottom = 9 },
+    shape = { melt = 16, parts = { circle(44, 34, 32), { left = 0, top = 32, right = 88, bottom = 92, radius = 44 } } },
+    background = { gradient = "linear", angle = 160, stops = { { 0, BODY_TOP }, { 0.55, "#141418" }, { 1, BODY_BOT } } },
     shadows = grab:map(function(g)
-        return { { color = "#00000055", blur = g and 30 or 14, offset = { y = g and 16 or 6 } } }
+        return { { color = "#00000060", blur = g and 30 or 14, offset = { y = g and 16 or 6 } } }
     end),
     animate = { shadows = 200 },
     children = {
+        -- The gloss on the crown, top left.
+        rect { width = 46, height = 32, margin = { top = 2, left = 10 }, background = { gradient = "radial", stops = { { 0, "#FFFFFFA0" }, { 1, "#FFFFFF00" } } } },
         rect {
-            width = "fill",
-            height = "fill",
-            shape = { melt = 10, parts = { circle(27, 33, 17), circle(57, 33, 17), { left = 15, top = 40, right = 69, bottom = 79, radius = 999 } } },
-            background = { gradient = "linear", angle = 180, stops = { { 0, PATCH }, { 1, BELLY } } },
-        },
-        -- A soft sheen on the crown.
-        rect { width = 16, height = 8, radius = 999, rotate = -25, margin = { top = 9, left = 20 }, background = "#FFFFFF24" },
-        row {
+            width = 66,
+            height = 50,
+            radius = 999,
             align_h = "center",
-            margin = { top = 22 },
-            spacing = 15,
-            animate = { scale = BLINK },
-            scale = T(1, 1),
-            children = { eye(), eye() },
+            align_v = "end",
+            margin = { bottom = 3 },
+            background = { gradient = "radial", stops = { { 0, "#FFFFFF" }, { 0.75, "#F1F1F3" }, { 1, "#C8C9D0" } } },
         },
-        row { align_h = "center", margin = { top = 45 }, spacing = 29, children = { cheek_dot(), cheek_dot() } },
+        row { align_h = "center", margin = { top = 14 }, spacing = -1, children = { eye(1), eye(-1) } },
+        row { align_h = "center", margin = { top = 7 }, spacing = -2, children = { brow(1), brow(-1) } },
+        row { align_h = "center", margin = { top = 48 }, spacing = 30, children = { cheek_dot(), cheek_dot() } },
         path {
             width = 28,
             height = 24,
             align_h = "center",
-            margin = { top = 40 },
+            margin = { top = 35 },
             origin = { x = 0.5, y = 0 },
-            scale = 0.72,
-            fill = BEAK,
+            scale = 1.12,
+            fill = { gradient = "linear", angle = 180, stops = { { 0, "#FFE36A" }, { 0.5, BEAK }, { 1, "#D9940A" } } },
             stroke = BEAK_D,
             stroke_width = 1.5,
             stroke_join = "round",
             commands = mouth_shape,
             animate = { commands = 120 },
         },
-        row { align_h = "center", margin = { top = -7 }, spacing = -1, children = { tuft(-20, 10), tuft(16, 13) } },
     },
 }
 
@@ -1475,15 +1510,16 @@ local squash = rect {
     on_double_click = spin_up,
     on_wheel = tickle,
     children = {
-        rect { align_h = "center", align_v = "end", margin = { bottom = 3 }, width = 66, height = 14, children = {
-            row { spacing = 18, children = { foot(1, "foot_l"), foot(-1, "foot_r") } },
-        } },
-        row { width = W, height = 40, margin = { top = 50 }, padding = { left = 5, right = 5 }, children = {
+        row { width = W, height = 40, margin = { top = 54 }, padding = { left = 4, right = 4 }, children = {
             arm(1, "arm_l"),
             rect { width = "fill", height = 1 },
             arm(-1, "arm_r"),
         } },
         body,
+        -- Big flat feet in front of the belly, as on Tux.
+        rect { align_h = "center", align_v = "end", margin = { bottom = 1 }, width = 84, height = 17, children = {
+            row { spacing = 6, children = { foot(1, "foot_l"), foot(-1, "foot_r") } },
+        } },
         -- Whatever the running antic brings along: a fish, a heart, notes.
         rect {
             width = W,
