@@ -15,9 +15,9 @@ local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
 -- Size of the mascot's box, and the gap it keeps from the screen edge.
 local W, H, EDGE, FLOOR_GAP = 104, 112, 8, 20
 
-local BODY_TOP, BODY_BOT = "#566897", "#2C3656"
+local BODY_TOP, BODY_BOT = "#3D4A6E", "#1C2236"
 local PATCH = "#FFF9F3" -- face patch; the eyelids match it
-local DARK, BELLY = "#10131A", "#ECEFF6"
+local DARK, BELLY = "#10131A", "#E6EBF5"
 local BEAK, BEAK_D = "#FF9E2C", "#D9701A"
 
 -- State -----------------------------------------------------------------------------------------
@@ -789,7 +789,7 @@ local function mouth(x0, x1, y0, top, bot)
     }
 end
 local MOUTHS = {
-    smile = mouth(4, 24, 7, 11, 22),
+    smile = mouth(6, 22, 6, 2, 25),
     grin = mouth(2, 26, 4, 7, 36),
     o = mouth(9, 19, 11, -3, 23),
     flat = mouth(7, 21, 10, 9, 12),
@@ -861,23 +861,30 @@ local function eye()
     }
 end
 
+-- A flipper hangs angled out from its shoulder; antics turn it from there.
 local function arm(side, part)
     return rect {
-        width = 14,
-        height = 30,
-        radius = { top_left = 7, top_right = 7, bottom_right = 12, bottom_left = 12 },
-        origin = { x = 0.5, y = 0.12 },
-        background = "#3E4B78",
-        rotate = side * 8,
-        animate = track(part, {}),
+        width = 13,
+        height = 34,
+        origin = { x = 0.5, y = 0.1 },
+        rotate = side * 10,
+        children = { rect {
+            width = 13,
+            height = 34,
+            radius = { top_left = 7, top_right = 7, bottom_right = 11, bottom_left = 11 },
+            origin = { x = 0.5, y = 0.1 },
+            background = { gradient = "linear", angle = 180, stops = { { 0, BODY_TOP }, { 1, BODY_BOT } } },
+            rotate = side * 8,
+            animate = track(part, {}),
+        } },
     }
 end
 
 local function foot(swing)
     return rect {
-        width = 24,
-        height = 11,
-        radius = 999,
+        width = 22,
+        height = 10,
+        radius = { top_left = 6, top_right = 6, bottom_right = 5, bottom_left = 5 },
         background = BEAK,
         origin = { x = 0.5, y = 0 },
         rotate = tilt:map(function(t) return swing * t * 0.9 end),
@@ -888,9 +895,9 @@ end
 
 local function cheek_dot()
     return rect {
-        width = 13,
-        height = 9,
-        radius = 5,
+        width = 11,
+        height = 8,
+        radius = 4,
         background = "#FF8FA0",
         opacity = cheek,
         animate = { opacity = 200 },
@@ -898,47 +905,50 @@ local function cheek_dot()
 end
 
 local function tuft(angle, h)
-    return rect { width = 6, height = h, radius = 3, rotate = angle, origin = { x = 0.5, y = 1 }, background = BODY_BOT }
+    return rect { width = 5, height = h, radius = 3, rotate = angle, origin = { x = 0.5, y = 1 }, background = BODY_TOP }
 end
 
--- A round, chubby penguin: wide-set glossy eyes low on a heart-shaped mask, a small beak, big cheeks.
+local function circle(cx, cy, r) return { left = cx - r, top = cy - r, right = cx + r, bottom = cy + r, radius = 999 } end
+
+-- A chick-shaped penguin: a round head melted into a wider, egg-shaped body, and a white front whose
+-- heart-shaped face runs down into the belly, as on an emperor chick.
 local body = rect {
     width = 84,
-    height = 76,
+    height = 82,
     align_h = "center",
     align_v = "end",
-    margin = { bottom = 13 },
-    radius = { top_left = 42, top_right = 42, bottom_right = 36, bottom_left = 36 },
+    margin = { bottom = 11 },
+    shape = { melt = 14, parts = { circle(42, 35, 35), { left = 0, top = 36, right = 84, bottom = 82, radius = 40 } } },
     background = { gradient = "linear", angle = 180, stops = { { 0, BODY_TOP }, { 1, BODY_BOT } } },
     shadows = grab:map(function(g)
-        return {
-            { color = "#00000055", blur = g and 30 or 14, offset = { y = g and 16 or 6 } },
-            { inset = true, color = "#FFFFFF30", blur = 8, offset = { y = 3 } },
-        }
+        return { { color = "#00000055", blur = g and 30 or 14, offset = { y = g and 16 or 6 } } }
     end),
     animate = { shadows = 200 },
     children = {
-        rect { width = 52, height = 36, radius = 999, align_h = "center", align_v = "end", margin = { bottom = 2 }, background = BELLY },
-        row { align_h = "center", margin = { top = 12 }, spacing = -10, children = {
-            rect { width = 40, height = 40, radius = 999, background = PATCH },
-            rect { width = 40, height = 40, radius = 999, background = PATCH },
-        } },
+        rect {
+            width = "fill",
+            height = "fill",
+            shape = { melt = 10, parts = { circle(27, 33, 17), circle(57, 33, 17), { left = 15, top = 40, right = 69, bottom = 79, radius = 999 } } },
+            background = { gradient = "linear", angle = 180, stops = { { 0, PATCH }, { 1, BELLY } } },
+        },
+        -- A soft sheen on the crown.
+        rect { width = 16, height = 8, radius = 999, rotate = -25, margin = { top = 9, left = 20 }, background = "#FFFFFF24" },
         row {
             align_h = "center",
             margin = { top = 22 },
-            spacing = 20,
+            spacing = 15,
             animate = { scale = BLINK },
             scale = T(1, 1),
             children = { eye(), eye() },
         },
-        row { align_h = "center", margin = { top = 44 }, spacing = 48, children = { cheek_dot(), cheek_dot() } },
+        row { align_h = "center", margin = { top = 45 }, spacing = 29, children = { cheek_dot(), cheek_dot() } },
         path {
             width = 28,
             height = 24,
             align_h = "center",
-            margin = { top = 42 },
+            margin = { top = 40 },
             origin = { x = 0.5, y = 0 },
-            scale = 0.78,
+            scale = 0.72,
             fill = BEAK,
             stroke = BEAK_D,
             stroke_width = 1.5,
@@ -946,7 +956,7 @@ local body = rect {
             commands = mouth_shape,
             animate = { commands = 120 },
         },
-        row { align_h = "center", margin = { top = -8 }, spacing = 0, children = { tuft(-24, 12), tuft(0, 15), tuft(24, 12) } },
+        row { align_h = "center", margin = { top = -7 }, spacing = -1, children = { tuft(-20, 10), tuft(16, 13) } },
     },
 }
 
@@ -1063,7 +1073,7 @@ local squash = rect {
         rect { align_h = "center", align_v = "end", margin = { bottom = 3 }, width = 66, height = 14, children = {
             row { spacing = 18, children = { foot(1), foot(-1) } },
         } },
-                row { width = W, height = 40, margin = { top = 50 }, padding = { left = 3, right = 3 }, children = {
+        row { width = W, height = 40, margin = { top = 50 }, padding = { left = 5, right = 5 }, children = {
             arm(1, "arm_l"),
             rect { width = "fill", height = 1 },
             arm(-1, "arm_r"),
