@@ -7,6 +7,8 @@
 fonts { "Noto Sans" }
 
 local VISIT_MIN, VISIT_MAX = 20000, 90000 -- ms hidden between visits
+local GAP_MIN, GAP_MAX = 2500, 6500 -- ms between antics
+local WALK_SPEED, STEP_MS = 140, 210 -- px/s along the floor, ms a step
 
 math.randomseed(os.time())
 
@@ -31,6 +33,7 @@ local tilt = state("mascot_tilt", 0)
 local phys = state("mascot_phys", "drag") -- motion set: drag, walk, coast, fall, or throw
 local flight = state("mascot_flight", false) -- a throw's keyframes, while `phys` is "throw"
 local air = state("mascot_air", false) -- thrown and not yet down
+local walk_ms = state("mascot_walk_ms", 1000) -- length of the walk under way
 local squish = state("mascot_squish", { x = 1, y = 1 })
 local mood = state("mascot_mood", "normal")
 local antic = state("mascot_antic", "")
@@ -92,15 +95,24 @@ end
 local function T(x, y) return { x = x, y = y } end
 local REST_SCALE = T(1, 1)
 
+local GRAVITY = 3200 -- px/s²
+local function ms(t) return math.max(1, math.floor(t * 1000 + 0.5)) end
+
+-- A stretch of parabola as a CSS bezier. `a` is the start speed times the duration over the distance:
+-- 0 starts from rest, 2 ends at rest.
+local function arc(a) return { 1 / 3, a / 3, 2 / 3, (a + 1) / 3 } end
+
 local ANTICS = {}
--- parts: layer name -> { property -> kf }. script: { { ms, mood } }. The run lasts as long as the
--- longest track, plus 80 ms of slack.
-local function def(name, parts, script)
+-- parts: layer name -> { property -> kf }. script: { { ms, mood?, line? } }. opts.after: lines it
+-- may say once done; opts.props(n): nodes shown for the run, ids suffixed with `n`. The run lasts as
+-- long as the longest track, plus 80 ms of slack.
+local function def(name, parts, script, opts)
     local dur = 0
     for _, props in pairs(parts) do
         for _, entry in pairs(props) do dur = math.max(dur, TOTAL[entry]) end
     end
-    ANTICS[name] = { parts = parts, script = script or {}, dur = dur + 80 }
+    opts = opts or {}
+    ANTICS[name] = { parts = parts, script = script or {}, dur = dur + 80, after = opts.after, props = opts.props }
 end
 
 -- The antics ------------------------------------------------------------------------------------
@@ -227,26 +239,38 @@ def("wake", {
     },
 }, { { 1, "surprised" }, { 800, "normal" } })
 
--- Penguin antics. `walk` is played while the rest spring carries it along the floor.
-local function wob(spec_len, step, amp)
-    local r, y = { { 0 } }, { { T(0, 0) } }
-    for i = 1, spec_len do
-        r[#r + 1] = { (i % 2 == 0 and -amp or amp), step }
-        y[#y + 1] = { T(0, i % 2 == 0 and 0 or -3), step }
+-- Steps, in place or along a walk: the body rocks onto one foot while the other lifts, and the
+-- flippers swing against it. `sway` slides the body onto the standing foot too.
+local function gait(steps, step_ms, rock, sway)
+    local half = step_ms / 2
+    local rot, bob, al, ar = { { 0 } }, { { T(0, 0) } }, { { 8 } }, { { -8 } }
+    local fl, fr = { { T(0, 0) } }, { { T(0, 0) } }
+    for i = 1, steps do
+        local s = i % 2 == 1 and 1 or -1 -- 1: standing on the right foot, the left one up
+        rot[#rot + 1] = { rock * s, step_ms, "in_out_sine" }
+        bob[#bob + 1] = { T(sway * s, -3), half, "out_quad" }
+        bob[#bob + 1] = { T(sway * s, 0), half, "in_quad" }
+        fl[#fl + 1] = { s > 0 and T(-1, -5) or T(0, 0), half, "out_quad" }
+        fl[#fl + 1] = { T(0, 0), half, "in_quad" }
+        fr[#fr + 1] = { s < 0 and T(1, -5) or T(0, 0), half, "out_quad" }
+        fr[#fr + 1] = { T(0, 0), half, "in_quad" }
+        al[#al + 1] = { 8 + 12 * s, step_ms, "in_out_sine" }
+        ar[#ar + 1] = { -8 + 12 * s, step_ms, "in_out_sine" }
     end
-    r[#r + 1] = { 0, 160 }
-    y[#y + 1] = { T(0, 0), 160 }
-    return kf(r), kf(y)
+    rot[#rot + 1] = { 0, 160 }
+    bob[#bob + 1] = { T(0, 0), 160 }
+    al[#al + 1] = { 8, 160 }
+    ar[#ar + 1] = { -8, 160 }
+    return {
+        spin = { rotate = kf(rot) },
+        act = { translate = kf(bob) },
+        foot_l = { translate = kf(fl) },
+        foot_r = { translate = kf(fr) },
+        arm_l = { rotate = kf(al) },
+        arm_r = { rotate = kf(ar) },
+    }
 end
-do
-    local r, y = wob(11, 200, 9)
-    def("walk", { spin = { rotate = r }, act = { translate = y } })
-    local r2, y2 = wob(6, 180, 11)
-    local x = { { T(0, 0) } }
-    for i = 1, 6 do x[#x + 1] = { T(i % 2 == 0 and -18 or 18, i % 2 == 0 and 0 or -3), 180 } end
-    x[#x + 1] = { T(0, 0), 180 }
-    def("waddle", { spin = { rotate = r2 }, act = { translate = kf(x) } }, { { 1, "happy" } })
-end
+def("waddle", gait(6, 180, 10, 14), { { 1, "happy" }, { 1100, "normal" } }, { after = { "waddle waddle", "that's the penguin shuffle." } })
 
 local function flap_arms(sign, n)
     local f = { { sign * 8 } }
@@ -287,7 +311,350 @@ def("slip", {
     arm_r = { rotate = kf { { -8 }, { -8, 610 }, { -20, 150 }, { -100, 150 }, { -20, 150 }, { -100, 150 }, { -20, 150 }, { -100, 150 }, { -8, 300 } } },
 }, { { 1, "surprised", "waaah!" }, { 560, "dizzy" }, { 1900, "sleepy" }, { 2300, "normal" } })
 
-local POOL = { "hop", "double_take", "spin", "sneeze", "sleep", "jelly", "stretch", "shimmy", "faceplant", "wave", "eye_roll", "peek", "waddle", "belly_slide", "flap", "slip" }
+-- Props: nodes an antic brings along, new each run so their keyframes start over.
+local function prop(kind, id, n, t)
+    t.id = id .. n
+    t.hittable = false
+    return kind(t)
+end
+
+local function fish(n)
+    return prop(path, "fish", n, {
+        width = 26,
+        height = 14,
+        align_h = "center",
+        margin = { top = 42 },
+        fill = "#7FB8E6",
+        stroke = "#4C86B8",
+        stroke_width = 1.2,
+        commands = {
+            { op = "M", points = { 1, 7 } },
+            { op = "Q", points = { 9, -1, 18, 7 } },
+            { op = "L", points = { 25, 1 } },
+            { op = "L", points = { 25, 13 } },
+            { op = "L", points = { 18, 7 } },
+            { op = "Q", points = { 9, 15, 1, 7 } },
+            { op = "Z", points = {} },
+        },
+        translate = T(0, 0),
+        opacity = 1,
+        rotate = 0,
+        animate = {
+            translate = { duration = 100, keyframes = { T(0, -120), { value = T(0, -120), duration = 250 }, { value = T(0, 0), duration = 520, easing = "in_quad" } } },
+            rotate = { duration = 100, keyframes = { 0, { value = 0, duration = 250 }, { value = 540, duration = 520, easing = "in_quad" } } },
+            opacity = { duration = 100, keyframes = { 1, { value = 1, duration = 770 }, { value = 0, duration = 60 } } },
+        },
+    })
+end
+
+local function heart(n, wait)
+    return prop(path, "heart", n .. "_" .. wait, {
+        width = 20,
+        height = 18,
+        align_h = "center",
+        margin = { top = 4 },
+        fill = "#FF6B8B",
+        commands = {
+            { op = "M", points = { 10, 17 } },
+            { op = "C", points = { 3, 12, 0, 8, 0, 5 } },
+            { op = "C", points = { 0, 2, 2, 0, 5, 0 } },
+            { op = "C", points = { 7, 0, 9, 1, 10, 3 } },
+            { op = "C", points = { 11, 1, 13, 0, 15, 0 } },
+            { op = "C", points = { 18, 0, 20, 2, 20, 5 } },
+            { op = "C", points = { 20, 8, 17, 12, 10, 17 } },
+            { op = "Z", points = {} },
+        },
+        translate = T(0, 0),
+        opacity = 0,
+        scale = 0.4,
+        animate = {
+            translate = { duration = 1300, delay = wait, easing = "out_sine", keyframes = { T(0, 0), T(wait > 0 and 10 or -8, -46) } },
+            opacity = { duration = 1300, delay = wait, keyframes = { 0, 1, 1, 0 } },
+            scale = { duration = 1300, delay = wait, easing = "out_back", keyframes = { 0.4, 1.1 } },
+        },
+    })
+end
+
+local function mark(n, content, color)
+    return prop(text, "mark", n, {
+        content = content,
+        font_size = 22,
+        font_weight = 800,
+        foreground = color,
+        align_h = "end",
+        margin = { top = -6, right = 10 },
+        scale = 1,
+        rotate = 0,
+        animate = {
+            scale = { duration = 100, keyframes = { 0, { value = 0, duration = 200 }, { value = 1, duration = 260, easing = "out_back" } } },
+            rotate = { duration = 500, easing = "in_out_sine", loops = 3, keyframes = { 0, 12, -12, 0 } },
+        },
+    })
+end
+
+local function note(n, wait, dx)
+    return prop(rect, "note", n .. "_" .. wait, {
+        width = 10,
+        height = 16,
+        align_h = dx > 0 and "end" or "start",
+        margin = { top = 10, left = 6, right = 6 },
+        opacity = 0,
+        translate = T(0, 0),
+        animate = {
+            translate = { duration = 1400, delay = wait, easing = "out_sine", keyframes = { T(0, 0), T(dx, -40) } },
+            opacity = { duration = 1400, delay = wait, keyframes = { 0, 1, 1, 0 } },
+        },
+        children = {
+            rect { width = 8, height = 6, radius = 3, align_v = "end", background = "#9CC8FF" },
+            rect { width = 2, height = 14, align_h = "end", margin = { right = 1 }, background = "#9CC8FF" },
+        },
+    })
+end
+
+local function sparkle(n, i)
+    local a = math.rad(i * 72 - 90)
+    return prop(rect, "spark", n .. "_" .. i, {
+        width = 8,
+        height = 8,
+        rotate = 45,
+        background = "#FFE066",
+        align_h = "center",
+        margin = { top = 10 },
+        opacity = 0,
+        translate = T(0, 0),
+        animate = {
+            translate = { duration = 100, keyframes = { T(0, 0), { value = T(0, 0), duration = 300 }, { value = T(math.cos(a) * 44, math.sin(a) * 34), duration = 600, easing = "out_cubic" } } },
+            opacity = { duration = 100, keyframes = { 0, { value = 0, duration = 300 }, { value = 1, duration = 60 }, { value = 1, duration = 300 }, { value = 0, duration = 300 } } },
+        },
+    })
+end
+
+local function dust(n, i, dx)
+    return prop(rect, "dust", n .. "_" .. i, {
+        width = 12,
+        height = 12,
+        radius = 999,
+        background = "#FFFFFFB0",
+        align_h = "center",
+        align_v = "end",
+        opacity = 0,
+        scale = 0.4,
+        translate = T(0, 0),
+        animate = {
+            translate = { duration = 500, delay = i * 400, easing = "out_cubic", keyframes = { T(0, 0), T(dx, -10) } },
+            opacity = { duration = 500, delay = i * 400, keyframes = { 0.9, 0 } },
+            scale = { duration = 500, delay = i * 400, keyframes = { 0.4, 1.4 } },
+        },
+    })
+end
+
+-- Repeats `frames` (pairs of value and ms) `n` times after the first frame, then returns to `rest_`.
+local function rep(first, n, frames, rest_, back_ms)
+    local f = { { first } }
+    for _ = 1, n do
+        for _, fr in ipairs(frames) do f[#f + 1] = fr end
+    end
+    f[#f + 1] = { rest_, back_ms or 200 }
+    return kf(f)
+end
+
+def("foot_tap", {
+    foot_r = { rotate = rep(0, 7, { { -24, 110, "out_quad" }, { 0, 110, "in_quad" } }, 0) },
+    spin = { rotate = kf { { 0 }, { 4, 300 }, { 4, 1440 }, { 0, 300 } } },
+    arm_l = { rotate = kf { { 8 }, { -20, 300 }, { -20, 1440 }, { 8, 300 } } },
+    pupil = { translate = kf { { T(0, 0) }, { T(3, -3), 300 }, { T(3, -3), 1440 }, { T(0, 0), 300 } } },
+}, { { 1, "bored" }, { 2000, "normal" } }, { after = { "any day now.", "I'm not impatient. you're slow.", "is my fish ready yet?" } })
+
+def("look_around", {
+    pupil = { translate = kf { { T(0, 0) }, { T(-4, 0), 140 }, { T(-4, 0), 700 }, { T(4, 0), 180 }, { T(4, 0), 700 }, { T(0, -4), 160 }, { T(0, -4), 500 }, { T(0, 0), 160 } } },
+    spin = { rotate = kf { { 0 }, { -6, 200 }, { -6, 640 }, { 6, 260 }, { 6, 620 }, { 0, 200 }, { 0, 520 } } },
+}, { { 600, "think" }, { 2300, "normal" } }, { after = { "coast is clear.", "nobody's watching. good.", "I sense... fish." } })
+
+do
+    local sp, tr, al, ar, fl, fr = { { 0 } }, { { T(0, 0) } }, { { 8 } }, { { -8 } }, { { T(0, 0) } }, { { T(0, 0) } }
+    for i = 1, 8 do
+        local s = i % 2 == 1 and 1 or -1
+        sp[#sp + 1] = { 10 * s, 300, "out_back" }
+        tr[#tr + 1] = { T(8 * s, -6), 150, "out_quad" }
+        tr[#tr + 1] = { T(8 * s, 0), 150, "in_quad" }
+        al[#al + 1] = { s > 0 and 140 or 30, 300, "out_back" }
+        ar[#ar + 1] = { s > 0 and -30 or -140, 300, "out_back" }
+        fl[#fl + 1] = { T(0, s > 0 and -6 or 0), 150 }
+        fl[#fl + 1] = { T(0, 0), 150 }
+        fr[#fr + 1] = { T(0, s < 0 and -6 or 0), 150 }
+        fr[#fr + 1] = { T(0, 0), 150 }
+    end
+    sp[#sp + 1] = { 0, 200 }
+    tr[#tr + 1] = { T(0, 0), 200 }
+    al[#al + 1] = { 8, 200 }
+    ar[#ar + 1] = { -8, 200 }
+    def("dance", {
+        spin = { rotate = kf(sp) },
+        act = { translate = kf(tr) },
+        arm_l = { rotate = kf(al) },
+        arm_r = { rotate = kf(ar) },
+        foot_l = { translate = kf(fl) },
+        foot_r = { translate = kf(fr) },
+    }, { { 1, "happy", "dance break!" }, { 2500, "normal" } }, { after = { "I've still got it.", "nobody puts Pip in a corner." } })
+end
+
+def("backflip", {
+    -- Lift and turn on the same layer, so it flips about its own middle.
+    spin = {
+        rotate = kf { { 0 }, { 0, 260 }, { -360, 620, "in_out_cubic" } },
+        translate = kf { { T(0, 0) }, { T(0, 0), 260 }, { T(0, -80), 310, "out_quad" }, { T(0, 0), 310, "in_quad" } },
+    },
+    act = { scale = kf { { REST_SCALE }, { T(1.18, 0.78), 240, "out_quad" }, { T(0.9, 1.12), 120 }, { T(0.9, 1.12), 520 }, { T(1.24, 0.76), 90 }, { REST_SCALE, 320, "out_back" } } },
+    ground = { scale = kf { { REST_SCALE }, { REST_SCALE, 260 }, { T(0.5, 0.5), 310 }, { REST_SCALE, 310 } } },
+}, { { 1, "effort" }, { 280, "surprised" }, { 900, "smug" }, { 2000, "normal" } }, { after = { "nailed it.", "I do my own stunts.", "the judges give it a 10." } })
+
+def("bow", {
+    act = { scale = kf { { REST_SCALE }, { T(1.06, 0.84), 380, "out_cubic" }, { T(1.06, 0.84), 600 }, { REST_SCALE, 360, "out_back" } } },
+    arm_r = { rotate = kf { { -8 }, { -75, 380 }, { -75, 600 }, { -8, 360 } } },
+    arm_l = { rotate = kf { { 8 }, { 35, 380 }, { 35, 600 }, { 8, 360 } } },
+    pupil = { translate = kf { { T(0, 0) }, { T(0, 4), 380 }, { T(0, 4), 600 }, { T(0, 0), 360 } } },
+}, { { 1, "happy" }, { 1340, "normal" } }, { after = { "thank you, thank you.", "I'll be here all week." } })
+
+def("shiver", {
+    act = {
+        translate = rep(T(0, 0), 15, { { T(2, 0), 45, "linear" }, { T(-2, 0), 45, "linear" } }, T(0, 0), 60),
+        scale = kf { { REST_SCALE }, { T(0.94, 0.97), 200 }, { T(0.94, 0.97), 1150 }, { REST_SCALE, 200 } },
+    },
+    arm_l = { rotate = kf { { 8 }, { -18, 200 }, { -18, 1150 }, { 8, 200 } } },
+    arm_r = { rotate = kf { { -8 }, { 18, 200 }, { 18, 1150 }, { -8, 200 } } },
+}, { { 1, "cold", "brrr" }, { 1500, "normal" } }, { after = { "who left the window open?", "I'm a penguin. I'm FINE.", "need... tiny scarf" } })
+
+do
+    -- Three hiccups at uneven gaps; each one jolts it up.
+    local tr, sc, script = { { T(0, 0) } }, { { REST_SCALE } }, {}
+    local at_ms = 0
+    for i, gap in ipairs { 300, 700, 450 } do
+        local up = i == 3 and -18 or -13
+        tr[#tr + 1] = { T(0, 0), gap }
+        tr[#tr + 1] = { T(0, up), 90, "out_quad" }
+        tr[#tr + 1] = { T(0, 0), 150, "in_quad" }
+        sc[#sc + 1] = { REST_SCALE, gap }
+        sc[#sc + 1] = { T(0.9, 1.14), 90 }
+        sc[#sc + 1] = { REST_SCALE, 150, "out_back" }
+        at_ms = at_ms + gap
+        script[#script + 1] = { at_ms, "surprised", i == 3 and "HIC!" or "hic!" }
+        script[#script + 1] = { at_ms + 240, "normal" }
+        at_ms = at_ms + 240
+    end
+    def("hiccup", { act = { translate = kf(tr), scale = kf(sc) } }, script, { after = { "...is it over?", "excuse me.", "I swallowed a bubble." } })
+end
+
+def("moonwalk", {
+    act = { translate = kf { { T(0, 0) }, { T(48, 0), 1600, "linear" }, { T(48, 0), 300 }, { T(0, 0), 600, "in_out_sine" } } },
+    spin = { rotate = kf { { 0 }, { -6, 200 }, { -6, 1400 }, { 0, 300 } } },
+    foot_l = { translate = rep(T(0, 0), 4, { { T(-6, -3), 200 }, { T(0, 0), 200 } }, T(0, 0)) },
+    foot_r = { translate = rep(T(0, 0), 4, { { T(0, 0), 200 }, { T(-6, -3), 200 } }, T(0, 0)) },
+}, { { 1, "smug" }, { 1700, "happy", "hee-hee!" }, { 2500, "normal" } })
+
+def("snack", {
+    pupil = { translate = kf { { T(0, 0) }, { T(0, -4), 200 }, { T(0, -4), 400 }, { T(0, 3), 250 }, { T(0, 0), 300 } } },
+    act = { scale = kf { { REST_SCALE }, { REST_SCALE, 770 }, { T(1.12, 0.9), 80 }, { T(0.97, 1.04), 160 }, { T(1.04, 0.97), 160 }, { T(0.98, 1.02), 160 }, { REST_SCALE, 160 } } },
+}, { { 250, "surprised" }, { 850, "happy", "nom" }, { 1900, "normal" } }, {
+    after = { "tastes like Tuesday.", "five stars. would gulp again.", "more where that came from?" },
+    props = function(n) return { fish(n) } end,
+})
+
+def("love", {
+    spin = { rotate = kf { { 0 }, { 5, 450, "in_out_sine" }, { -5, 600, "in_out_sine" }, { 5, 600, "in_out_sine" }, { 0, 450 } } },
+    arm_l = { rotate = kf { { 8 }, { -22, 300 }, { -22, 1500 }, { 8, 300 } } },
+    arm_r = { rotate = kf { { -8 }, { 22, 300 }, { 22, 1500 }, { -8, 300 } } },
+    act = { scale = kf { { REST_SCALE }, { T(1.03, 0.97), 300 }, { REST_SCALE, 300 }, { T(1.03, 0.97), 300 }, { REST_SCALE, 300 } } },
+}, { { 1, "happy" }, { 2100, "normal" } }, {
+    after = { "you're alright, you know.", "don't make it weird." },
+    props = function(n) return { heart(n, 0), heart(n, 500) } end,
+})
+
+def("zoomies", {
+    act = { translate = kf { { T(0, 0) }, { T(70, 0), 260, "in_out_quad" }, { T(-70, 0), 420, "in_out_quad" }, { T(60, 0), 400, "in_out_quad" }, { T(-40, 0), 360, "in_out_quad" }, { T(0, 0), 320, "out_back" } } },
+    spin = { rotate = kf { { 0 }, { 14, 260 }, { -14, 420 }, { 14, 400 }, { -10, 360 }, { 0, 320 } } },
+    foot_l = { translate = rep(T(0, 0), 9, { { T(0, -5), 90 }, { T(0, 0), 90 } }, T(0, 0), 140) },
+    foot_r = { translate = rep(T(0, 0), 9, { { T(0, 0), 90 }, { T(0, -5), 90 } }, T(0, 0), 140) },
+}, { { 1, "happy", "ZOOMIES" }, { 1800, "dizzy" }, { 2500, "normal" } }, {
+    after = { "*pant pant*", "I don't know why I did that." },
+    props = function(n) return { dust(n, 0, -30), dust(n, 1, 30), dust(n, 2, -30) } end,
+})
+
+def("ponder", {
+    spin = { rotate = kf { { 0 }, { 9, 300 }, { 9, 1600 }, { 0, 300 } } },
+    pupil = { translate = kf { { T(0, 0) }, { T(-3, -4), 300 }, { T(-3, -4), 1600 }, { T(0, 0), 300 } } },
+    arm_r = { rotate = rep(-8, 4, { { -40, 200 }, { -25, 200 } }, -8, 300) },
+}, { { 1, "think" }, { 2200, "normal" } }, {
+    after = { "hmm.", "what if... fish, but bigger?", "where do icebergs go at night?", "I forgot what I was thinking." },
+    props = function(n) return { mark(n, "?", "#7FB8FF") } end,
+})
+
+def("tada", {
+    act = {
+        translate = kf { { T(0, 0) }, { T(0, 0), 220 }, { T(0, -26), 220, "out_quad" }, { T(0, 0), 220, "in_quad" }, { T(0, 0), 800 } },
+        scale = kf { { REST_SCALE }, { T(1.15, 0.82), 220 }, { T(0.9, 1.12), 220 }, { T(1.12, 0.88), 220 }, { REST_SCALE, 260, "out_back" } },
+    },
+    arm_l = { rotate = kf { { 8 }, { 8, 220 }, { 145, 220, "out_back" }, { 145, 900 }, { 8, 300 } } },
+    arm_r = { rotate = kf { { -8 }, { -8, 220 }, { -145, 220, "out_back" }, { -145, 900 }, { -8, 300 } } },
+}, { { 1, "effort" }, { 240, "happy", "ta-da!" }, { 1700, "normal" } }, {
+    after = { "you may applaud.", "and for my next trick..." },
+    props = function(n) return { sparkle(n, 0), sparkle(n, 1), sparkle(n, 2), sparkle(n, 3), sparkle(n, 4) } end,
+})
+
+def("squats", {
+    act = { scale = rep(REST_SCALE, 4, { { T(1.1, 0.8), 350, "in_out_sine" }, { REST_SCALE, 350, "in_out_sine" } }, REST_SCALE) },
+    arm_l = { rotate = kf { { 8 }, { 80, 250 }, { 80, 2550 }, { 8, 300 } } },
+    arm_r = { rotate = kf { { -8 }, { -80, 250 }, { -80, 2550 }, { -8, 300 } } },
+}, { { 1, "effort", "one..." }, { 700, nil, "two..." }, { 1400, nil, "three..." }, { 2100, nil, "...four" }, { 2900, "normal" } }, {
+    after = { "never skip leg day.", "these are thighs. trust me." },
+})
+
+def("sing", {
+    spin = { rotate = kf { { 0 }, { 6, 450, "in_out_sine" }, { -6, 600, "in_out_sine" }, { 6, 600, "in_out_sine" }, { -6, 600, "in_out_sine" }, { 0, 450 } } },
+    act = { scale = rep(REST_SCALE, 3, { { T(0.97, 1.05), 300 }, { REST_SCALE, 300 } }, REST_SCALE) },
+}, { { 1, "sing", "la la laaa" }, { 600, "happy" }, { 1000, "sing" }, { 1600, "happy" }, { 2000, "sing" }, { 2700, "normal" } }, {
+    after = { "the acoustics in here are great.", "I'm available for weddings." },
+    props = function(n) return { note(n, 0, -16), note(n, 700, 16), note(n, 1400, -12) } end,
+})
+
+-- Jumps clean off the top of the screen and comes back down a while later; built for where it stands.
+local function boing(y)
+    local h = y + H + 40
+    local t = ms(math.sqrt(2 * h / GRAVITY))
+    def("boing", {
+        act = {
+            translate = kf { { T(0, 0) }, { T(0, 0), 260 }, { T(0, -h), t, arc(2) }, { T(0, -h), 900 }, { T(0, 0), t, arc(0) }, { T(0, 0), 330 } },
+            scale = kf { { REST_SCALE }, { T(1.2, 0.76), 260, "out_quad" }, { T(0.84, 1.2), 120 }, { T(0.92, 1.08), math.max(1, t - 120) }, { T(0.92, 1.08), 900 }, { T(0.86, 1.18), t }, { T(1.3, 0.7), 70 }, { REST_SCALE, 260, "out_back" } },
+        },
+        ground = { scale = kf { { REST_SCALE }, { REST_SCALE, 260 }, { T(0.2, 0.2), t }, { T(0.2, 0.2), 900 }, { REST_SCALE, t } } },
+    }, { { 1, "effort" }, { 260, "happy", "boing!" }, { 260 + 2 * t + 900, "dizzy" }, { 260 + 2 * t + 2200, "normal" } }, {
+        after = { "I touched the sky.", "the ceiling is a lie.", "...did I miss anything?" },
+    })
+    return "boing"
+end
+
+-- Idle fidgets between antics: short, so they cost little.
+def("glance", { pupil = { translate = kf { { T(0, 0) }, { T(4, 1), 120 }, { T(4, 1), 900 }, { T(0, 0), 160 } } } })
+def("look_up", {
+    pupil = { translate = kf { { T(0, 0) }, { T(-1, -4), 160 }, { T(-1, -4), 900 }, { T(0, 0), 200 } } },
+    spin = { rotate = kf { { 0 }, { -4, 200 }, { -4, 860 }, { 0, 200 } } },
+})
+def("shuffle", {
+    foot_l = { translate = kf { { T(0, 0) }, { T(-2, -4), 120 }, { T(0, 0), 120 }, { T(0, 0), 240 }, { T(-2, -4), 120 }, { T(0, 0), 120 } } },
+    foot_r = { translate = kf { { T(0, 0) }, { T(0, 0), 240 }, { T(2, -4), 120 }, { T(0, 0), 120 } } },
+    spin = { rotate = kf { { 0 }, { 3, 240 }, { -3, 240 }, { 0, 240 } } },
+})
+def("sigh", { act = { scale = kf { { REST_SCALE }, { T(0.97, 1.05), 700, "in_out_sine" }, { T(1.03, 0.97), 800, "in_out_sine" }, { REST_SCALE, 500, "in_out_sine" } } } })
+def("blink_twice", { pupil = { translate = kf { { T(0, 0) }, { T(0, 0), 420 } } } }, { { 1, "sleep" }, { 90, "normal" }, { 220, "sleep" }, { 310, "normal" } })
+def("preen", {
+    arm_l = { rotate = kf { { 8 }, { 40, 140 }, { 10, 140 }, { 40, 140 }, { 8, 160 } } },
+    spin = { rotate = kf { { 0 }, { -5, 200 }, { -5, 300 }, { 0, 220 } } },
+})
+
+local POOL = {
+    "hop", "double_take", "spin", "sneeze", "sleep", "jelly", "stretch", "shimmy", "faceplant", "wave", "eye_roll", "peek",
+    "waddle", "belly_slide", "flap", "slip", "foot_tap", "look_around", "dance", "backflip", "bow", "shiver", "hiccup",
+    "moonwalk", "snack", "love", "zoomies", "ponder", "tada", "squats", "boing", "sing",
+}
 
 -- Playing an antic -------------------------------------------------------------------------------
 
@@ -303,6 +670,12 @@ local LINES = {
     "is this a good iceberg?", "where is everyone?", "your windows look cozy",
     "have you tried turning the ocean off?", "this desktop needs more snow", "I do my own stunts",
     "reply-all was a mistake", "per my last honk", "that deadline looks fishy",
+    "your wallpaper has no fish in it", "I'm on a seafood diet.", "is the cloud made of snow?",
+    "a penguin's work is never done", "I identify as a small iceberg", "don't mind me, just loitering",
+    "who's a good bird? me.", "I've been waiting all day for this", "are these pixels heated?",
+    "how many tabs is too many? asking for a friend", "Antarctica called. I didn't pick up.",
+    "flap flap. nothing. as usual.", "I have opinions about krill", "do you ever just... waddle?",
+    "this screen is 90% not ocean", "I'm small, but I'm loud.",
 }
 local POKE_LINES = { "hehe", "that tickles!", "boop", "hey!", "eep", "again!", "ok ok ok", "wheee" }
 
@@ -348,7 +721,6 @@ reset()
 
 -- Throw: a projectile under gravity, played as keyframes -------------------------------------------
 
-local GRAVITY = 3200 -- px/s²
 local THROW_MAX = 3200 -- px/s, the fastest flick it keeps
 local WALL_KEEP = 0.5 -- share of the speed kept off a side wall
 local BOUNCE_KEEP = 0.12 -- share of the fall's energy bounced back up
@@ -356,11 +728,6 @@ local SLIDE = 0.12 -- s of its landing speed it slides on
 local TURN_SPEED = 1600 -- px/s of sideways flick per somersault
 local SQUASH_MS = 70
 
-local function ms(t) return math.max(1, math.floor(t * 1000 + 0.5)) end
-
--- A stretch of parabola as a CSS bezier. `a` is the start speed times the duration over the distance:
--- 0 starts from rest, 2 ends at rest.
-local function arc(a) return { 1 / 3, a / 3, 2 / 3, (a + 1) / 3 } end
 
 -- Keyframes per axis for a release at (x, y) with velocity (vx, vy), its tilt `turn` at release.
 local function flight_path(x, y, vx, vy, turn, s)
@@ -466,22 +833,31 @@ local out, leaving, left, on_done = false, false, 0, nil
 
 local next_step, leave, schedule_visit
 
-local function play(name)
-    cancel_pending()
-    local a = ANTICS[name]
+local IDLE = { "glance", "shuffle", "sigh", "blink_twice", "look_up", "preen" }
+local BEAT_MS = 450 -- the pause before a punchline
+local plays = 0 -- each run's props are new nodes, so their keyframes start over
+
+-- Sets the antic and runs its script. The same keyframes restart only after a pass without them.
+local function start(name)
+    plays = plays + 1
     if antic:get() == name then
-        -- The same keyframes restart only after a pass without them.
         antic:set("")
         later(1, function() antic:set(name) end)
     else
         antic:set(name)
     end
-    for _, s in ipairs(a.script) do
+    for _, s in ipairs(ANTICS[name].script) do
         later(s[1], function()
-            mood:set(s[2])
+            if s[2] then mood:set(s[2]) end
             if s[3] then speak(s[3]) end
         end)
     end
+end
+
+local function play(name)
+    cancel_pending()
+    local a = ANTICS[name]
+    start(name)
     later(a.dur, function()
         antic:set("")
         if name == "sleep" then
@@ -498,9 +874,32 @@ local function play(name)
         mood:set("normal")
         local f = on_done
         on_done = nil
-        if f then f() else next_step() end
+        if f then return f() end
+        if a.after and math.random() < 0.6 then later(BEAT_MS, function() speak(a.after[math.random(#a.after)]) end) end
+        next_step()
     end)
 end
+
+-- A small idle motion between antics; it leaves the plan alone.
+local function fidget()
+    if antic:get() ~= "" or asleep:get() or grab:get() then return end
+    local name = IDLE[math.random(#IDLE)]
+    start(name)
+    later(ANTICS[name].dur, function()
+        if antic:get() ~= name then return end
+        antic:set("")
+        mood:set("normal")
+    end)
+end
+
+-- Antics built when picked, for where Pip stands.
+local CHOOSE = {
+    belly_slide = function()
+        local s, r = screen:get(), rest:get()
+        return r.x > s.width / 2 and "belly_slide_l" or "belly_slide_r"
+    end,
+    boing = function() return boing(rest:get().y) end,
+}
 
 -- An antic that says its own line skips the chatter, so the two do not talk over each other.
 local function speaks(name)
@@ -512,22 +911,30 @@ end
 
 function next_step()
     if not out or leaving or grab:get() then return end
-    if left > 0 then
-        left = left - 1
-        later(math.random(2000, 6000), function()
-            local pick
-            repeat pick = POOL[math.random(#POOL)] until pick ~= last
-            last = pick
-            if pick == "belly_slide" then
-                local s, r = screen:get(), rest:get()
-                pick = (r and s and r.x > s.width / 2) and "belly_slide_l" or "belly_slide_r"
-            end
-            if not bubble_on:get() and not speaks(pick) and math.random() < 0.4 then chatter() end
-            play(pick)
-        end)
-    else
-        later(math.random(1500, 3500), leave)
-    end
+    if left <= 0 then return later(math.random(1500, 3500), leave) end
+    left = left - 1
+    local gap = math.random(GAP_MIN, GAP_MAX)
+    if math.random() < 0.75 then later(gap * 0.45, fidget) end
+    later(gap, function()
+        local pick
+        repeat pick = POOL[math.random(#POOL)] until pick ~= last
+        last = pick
+        pick = CHOOSE[pick] and CHOOSE[pick]() or pick
+        if not bubble_on:get() and not speaks(pick) and math.random() < 0.35 then chatter() end
+        play(pick)
+    end)
+end
+
+-- Waddles to `x` along the floor at walking pace, the steps timed to the distance.
+local function walk_to(x, done)
+    local r = rest:get()
+    local steps = math.max(2, math.floor(math.abs(x - r.x) / WALK_SPEED * 1000 / STEP_MS + 0.5))
+    def("walk", gait(steps, STEP_MS, 8, 0))
+    walk_ms:set(steps * STEP_MS)
+    phys:set("walk")
+    rest:set({ x = x, y = r.y })
+    play("walk")
+    on_done = done
 end
 
 local function hide()
@@ -543,10 +950,7 @@ function leave()
     leaving = true
     local s, r = screen:get(), rest:get()
     if math.random() < 0.5 and r.y <= floor_y(s) + 2 then
-        phys:set("walk")
-        rest:set({ x = r.x < s.width / 2 and -W - 20 or s.width + 20, y = r.y })
-        play("walk")
-        on_done = hide
+        walk_to(r.x < s.width / 2 and -W - 20 or s.width + 20, hide)
     else
         play("wave")
         on_done = function()
@@ -575,13 +979,9 @@ local function enter(tries)
         -- Waddle in from a side, placed off-screen first.
         local from_left = math.random() < 0.5
         local tx = from_left and math.random(80, 400) or s.width - W - math.random(80, 400)
-        phys:set("walk")
+        phys:set("drag")
         rest:set({ x = from_left and -W - 20 or s.width + 20, y = fy })
-        later(60, function()
-            rest:set({ x = tx, y = fy })
-            play("walk")
-            on_done = arrived
-        end)
+        later(60, function() walk_to(tx, arrived) end)
     elseif how < 0.8 then
         -- Peek over the bottom edge, look around, then climb up.
         local x = math.random(EDGE, s.width - W - EDGE)
@@ -777,6 +1177,11 @@ local MOODS = {
     sneeze = { top = 20, bot = 0, es = 1, ps = 1, mouth = "sneeze", cheek = 0.5 },
     dizzy = { top = 0, bot = 0, es = 1.1, ps = 0.4, mouth = "wobble", cheek = 0.5 },
     bored = { top = 8, bot = 0, es = 1, ps = 1, mouth = "flat", cheek = 0.3 },
+    cold = { top = 5, bot = 0, es = 0.92, ps = 1, mouth = "wobble", cheek = 0.1 },
+    think = { top = 7, bot = 0, es = 1, ps = 0.85, mouth = "flat", cheek = 0.4 },
+    effort = { top = 9, bot = 5, es = 1, ps = 1, mouth = "flat", cheek = 1 },
+    smug = { top = 9, bot = 0, es = 1, ps = 1, mouth = "grin", cheek = 0.8 },
+    sing = { top = 0, bot = 13, es = 1, ps = 1, mouth = "o", cheek = 0.9 },
 }
 
 -- A mouth is always M, Q, Q, Z so one shape morphs into the next point by point.
@@ -880,7 +1285,7 @@ local function arm(side, part)
     }
 end
 
-local function foot(swing)
+local function foot(swing, part)
     return rect {
         width = 22,
         height = 10,
@@ -889,7 +1294,7 @@ local function foot(swing)
         origin = { x = 0.5, y = 0 },
         rotate = tilt:map(function(t) return swing * t * 0.9 end),
         translate = grab:map(function(g) return T(0, g and 5 or 0) end),
-        animate = { rotate = SPRING(120, 5), translate = SPRING(300, 14) },
+        animate = track(part, { rotate = SPRING(120, 5), translate = SPRING(300, 14) }),
     }
 end
 
@@ -1071,7 +1476,7 @@ local squash = rect {
     on_wheel = tickle,
     children = {
         rect { align_h = "center", align_v = "end", margin = { bottom = 3 }, width = 66, height = 14, children = {
-            row { spacing = 18, children = { foot(1), foot(-1) } },
+            row { spacing = 18, children = { foot(1, "foot_l"), foot(-1, "foot_r") } },
         } },
         row { width = W, height = 40, margin = { top = 50 }, padding = { left = 5, right = 5 }, children = {
             arm(1, "arm_l"),
@@ -1079,6 +1484,16 @@ local squash = rect {
             arm(-1, "arm_r"),
         } },
         body,
+        -- Whatever the running antic brings along: a fish, a heart, notes.
+        rect {
+            width = W,
+            height = H,
+            hittable = false,
+            children = antic:map(function(a)
+                local d = ANTICS[a]
+                return d and d.props and d.props(plays) or {}
+            end),
+        },
         puff,
         stars,
         alert,
@@ -1179,11 +1594,14 @@ local speech = rect {
 -- Each axis and the tilt has its own entry, so a throw's rise, fall and drift each keep their curve.
 local MOTION = {
     drag = { x = SPRING(520, 34), y = SPRING(520, 34), rotate = SPRING(260, 16) },
-    walk = { x = SPRING(12, 7), y = SPRING(12, 7), rotate = SPRING(120, 8) },
     coast = { x = SPRING(70, 15), y = SPRING(70, 15), rotate = SPRING(120, 8) },
     fall = { x = SPRING(260, 12), y = SPRING(260, 12), rotate = SPRING(200, 9) },
 }
-local motion = computed({ phys, flight }, function(p, f) return p == "throw" and f or MOTION[p] end)
+local motion = computed({ phys, flight, walk_ms }, function(p, f, walk)
+    if p == "throw" then return f end
+    if p == "walk" then return { x = { duration = walk, easing = "in_out_sine" }, y = MOTION.drag.y, rotate = MOTION.drag.rotate } end
+    return MOTION[p]
+end)
 
 schedule_visit()
 
