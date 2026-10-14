@@ -1,7 +1,8 @@
 -- Pip: a desktop penguin with no function. Most of the time it is hidden below the screen edge or
 -- off to the side; every 20-90 s it waddles in or peeks up, does one to three silly things, may say
 -- something, and leaves. Grab and throw it while it is out; click it for a giggle, or to wake it.
--- Hidden, nothing is drawn or animated; out, only a blink runs between antics.
+-- Hidden, its panel is unmapped: nothing is drawn, animated or composited. Each visit maps it again on
+-- the output the compositor picks.
 
 fonts { "Noto Sans" }
 
@@ -38,12 +39,18 @@ local screen = geometry("screen")
 
 local function floor_y(s) return s.height - H - FLOOR_GAP end
 
-local pos = computed({ at, grab, rest, screen }, function(p, g, r, s)
+local pos = computed({ at, grab, rest }, function(p, g, r)
     if g and p then return { x = g.ox + p.x - g.px, y = g.oy + p.y - g.py } end
-    if r then return r end
-    if not s then return { x = 100, y = 100 } end
-    return { x = s.width * 0.72, y = floor_y(s) }
+    return r or { x = 0, y = 0 }
 end)
+
+-- Where the box is drawn, from a pointer handler's node-local point. A spring's live value cannot be
+-- read, but the pointer is over the pixels it hit.
+local function drawn_at(local_pt)
+    local p = at:get()
+    if not (p and local_pt) then return rest:get() end
+    return { x = p.x - local_pt.x, y = p.y - local_pt.y }
+end
 
 -- Timers ----------------------------------------------------------------------------------------
 
@@ -107,9 +114,12 @@ def("double_take", {
 }, { { 1580, "surprised" }, { 2100, "normal" } })
 
 def("spin", {
-    spin = { rotate = kf { { 0 }, { 0, 220 }, { 360, 700, "out_cubic" } } },
-    act = {
+    -- The lift is on `spin` too: `translate` applies after `rotate`, so it turns about its own centre.
+    spin = {
+        rotate = kf { { 0 }, { 0, 220 }, { 360, 700, "out_cubic" } },
         translate = kf { { T(0, 0) }, { T(0, 0), 220 }, { T(0, -40), 300, "out_quad" }, { T(0, 0), 400, "in_quad" } },
+    },
+    act = {
         scale = kf { { REST_SCALE }, { T(1.12, 0.82), 220 }, { T(0.92, 1.12), 300 }, { T(1.16, 0.8), 400 }, { REST_SCALE, 160 } },
     },
     ground = { scale = kf { { REST_SCALE }, { REST_SCALE, 220 }, { T(0.6, 0.6), 300 }, { REST_SCALE, 400 } } },
@@ -290,12 +300,15 @@ local POKE_LINES = { "hehe", "that tickles!", "boop", "hey!", "eep", "again!", "
 
 -- Speech --------------------------------------------------------------------------------------------
 
-local bubble_timer, last_line
-local function speak(line, ms)
+-- Each line gets a fresh bubble id, so a new line pops in while the old one shrinks away.
+local bubble_timer, last_line, lines_said = nil, nil, 0
+local function speak(line)
     if bubble_timer then bubble_timer:cancel() end
+    lines_said = lines_said + 1
     say:set(line)
     bubble_on:set(true)
-    bubble_timer = timer(ms, function()
+    -- Long enough to read: 0.9 s plus 60 ms a character.
+    bubble_timer = timer(clamp(900 + 60 * #line, 1400, 4500), function()
         bubble_timer = nil
         bubble_on:set(false)
     end)
@@ -305,32 +318,52 @@ local function chatter()
     local line
     repeat line = LINES[math.random(#LINES)] until line ~= last_line
     last_line = line
-    speak(line, math.random(2500, 4000))
+    speak(line)
 end
+
+-- Reload clears every timer, so a visit cut short would leave Pip, a bubble or a grab on screen for
+-- good: each evaluation starts hidden.
+local function reset()
+    present:set(false)
+    rest:set(false)
+    grab:set(false)
+    bubble_on:set(false)
+    asleep:set(false)
+    antic:set("")
+    mood:set("normal")
+    phys:set("drag")
+    tilt:set(0)
+    squish:set(T(1, 1))
+end
+reset()
 
 -- A visit: appear, one to three antics, leave ------------------------------------------------------
 
 local last
 local out, leaving, left, on_done = false, false, 0, nil
-local visit_timer
-local function rest_mood() return asleep:get() and "sleep" or "normal" end
 
 local next_step, leave, schedule_visit
 
 local function play(name)
     cancel_pending()
     local a = ANTICS[name]
-    antic:set(name)
+    if antic:get() == name then
+        -- The same keyframes restart only after a pass without them.
+        antic:set("")
+        later(1, function() antic:set(name) end)
+    else
+        antic:set(name)
+    end
     for _, s in ipairs(a.script) do
         later(s[1], function()
             mood:set(s[2])
-            if s[3] then speak(s[3], s[4] or 1600) end
+            if s[3] then speak(s[3]) end
         end)
     end
     later(a.dur, function()
+        antic:set("")
         if name == "sleep" then
             asleep:set(true)
-            antic:set("")
             mood:set("sleep")
             -- Asleep until poked, or 25 s, then it tucks itself away.
             later(25000, function()
@@ -340,12 +373,19 @@ local function play(name)
             end)
             return
         end
-        antic:set("")
-        mood:set(rest_mood())
+        mood:set("normal")
         local f = on_done
         on_done = nil
         if f then f() else next_step() end
     end)
+end
+
+-- An antic that says its own line skips the chatter, so the two do not talk over each other.
+local function speaks(name)
+    for _, s in ipairs(ANTICS[name].script) do
+        if s[3] then return true end
+    end
+    return false
 end
 
 function next_step()
@@ -353,7 +393,6 @@ function next_step()
     if left > 0 then
         left = left - 1
         later(math.random(2000, 6000), function()
-            if math.random() < 0.4 then chatter() end
             local pick
             repeat pick = POOL[math.random(#POOL)] until pick ~= last
             last = pick
@@ -361,6 +400,7 @@ function next_step()
                 local s, r = screen:get(), rest:get()
                 pick = (r and s and r.x > s.width / 2) and "belly_slide_l" or "belly_slide_r"
             end
+            if not bubble_on:get() and not speaks(pick) and math.random() < 0.4 then chatter() end
             play(pick)
         end)
     else
@@ -370,12 +410,8 @@ end
 
 local function hide()
     cancel_pending()
-    present:set(false)
-    bubble_on:set(false)
-    asleep:set(false)
-    antic:set("")
-    mood:set("normal")
     out, leaving, on_done = false, false, nil
+    reset()
     schedule_visit()
 end
 
@@ -383,9 +419,9 @@ function leave()
     if grab:get() or not out then return end
     leaving = true
     local s, r = screen:get(), rest:get()
-    if math.random() < 0.5 then
+    if math.random() < 0.5 and r.y <= floor_y(s) + 2 then
         phys:set("walk")
-        rest:set({ x = r.x < s.width / 2 and -W - 20 or s.width + 20, y = floor_y(s) })
+        rest:set({ x = r.x < s.width / 2 and -W - 20 or s.width + 20, y = r.y })
         play("walk")
         on_done = hide
     else
@@ -398,35 +434,35 @@ function leave()
     end
 end
 
-local function appear()
+local function arrived()
+    if math.random() < 0.5 then chatter() end
+    next_step()
+end
+
+-- The panel is mapped by now; its size is known once it has laid out on the picked output.
+local function enter(tries)
     local s = screen:get()
-    if not s or s.width < 200 then return schedule_visit() end
+    if not s or s.width < 200 then
+        if tries < 10 then return later(50, function() enter(tries + 1) end) end
+        return hide()
+    end
     local fy = floor_y(s)
-    out, leaving, left, on_done = true, false, math.random(1, 3), nil
-    mood:set("normal")
-    squish:set(T(1, 1))
-    tilt:set(0)
     if math.random() < 0.5 then
-        -- Waddle in from a side, drawn off-screen first.
+        -- Waddle in from a side, placed off-screen first.
         local from_left = math.random() < 0.5
         local tx = from_left and math.random(80, 400) or s.width - W - math.random(80, 400)
         phys:set("walk")
         rest:set({ x = from_left and -W - 20 or s.width + 20, y = fy })
-        present:set(true)
         later(60, function()
             rest:set({ x = tx, y = fy })
             play("walk")
-            on_done = function()
-                if math.random() < 0.5 then chatter() end
-                next_step()
-            end
+            on_done = arrived
         end)
     else
         -- Peek over the bottom edge, look around, then climb up.
         local x = math.random(EDGE, s.width - W - EDGE)
         phys:set("coast")
         rest:set({ x = x, y = s.height + 10 })
-        present:set(true)
         later(60, function()
             rest:set({ x = x, y = s.height - 84 })
             later(700, function()
@@ -434,23 +470,40 @@ local function appear()
                 on_done = function()
                     phys:set("fall")
                     rest:set({ x = x, y = fy })
-                    later(900, function()
-                        if math.random() < 0.5 then chatter() end
-                        next_step()
-                    end)
+                    later(900, arrived)
                 end
             end)
         end)
     end
 end
 
-function schedule_visit()
-    visit_timer = timer(math.random(VISIT_MIN, VISIT_MAX), appear)
+local function appear()
+    out, leaving, left, on_done = true, false, math.random(1, 3), nil
+    present:set(true)
+    later(120, function() enter(1) end)
 end
 
-local function stop()
+function schedule_visit() timer(math.random(VISIT_MIN, VISIT_MAX), appear) end
+
+-- `mantle set mascot_present true|false` starts or ends a visit.
+present:on_change(function(on)
+    if on and not out then
+        appear()
+    elseif not on and out then
+        hide()
+    end
+end)
+
+-- Stops the running antic and, mid-walk, plants it where it is drawn.
+local function stop(local_pt)
     cancel_pending()
     antic:set("")
+    leaving, on_done = false, nil
+    local p = phys:get()
+    if p == "walk" or p == "coast" then
+        phys:set("drag")
+        rest:set(drawn_at(local_pt))
+    end
 end
 
 -- Grab, throw, land ---------------------------------------------------------------------------------
@@ -466,15 +519,14 @@ local function land()
     later(math.random(4000, 8000), leave)
 end
 
-local function drag(_, _, phase, _, velocity)
+local function drag(_, local_pt, phase, _, velocity)
     local p = at:get()
     if phase == "start" then
         moved = false
         if not p then return end
         stop()
-        out, leaving, on_done = true, false, nil
-        local s = screen:get()
-        local r = rest:get() or { x = s and s.width * 0.72 or 100, y = s and floor_y(s) or 100 }
+        out = true
+        local r = drawn_at(local_pt)
         local was_asleep = asleep:get()
         asleep:set(false)
         phys:set("drag")
@@ -490,7 +542,7 @@ local function drag(_, _, phase, _, velocity)
             moved = true
             mood:set("surprised")
             squish:set(T(0.88, 1.16)) -- stretched by the scruff of the neck
-            speak("put me down!!", 2200)
+            speak("put me down!!")
         end
         tilt:set(clamp(velocity.x / 90, -28, 28))
         return
@@ -503,7 +555,7 @@ local function drag(_, _, phase, _, velocity)
     if not moved then
         rest:set({ x = g.ox, y = g.oy })
         squish:set(T(1, 1))
-        mood:set(rest_mood())
+        mood:set("normal")
         return
     end
     local x = clamp(here.x + velocity.x * 0.18, EDGE, math.max(EDGE, s.width - W - EDGE))
@@ -529,13 +581,13 @@ end
 -- Clicks: left giggles (or wakes it), four quick ones make it cross, right chats, double spins ------
 
 local pokes, poke_reset = 0, nil
-local function poke(_, button)
+local function poke(_, button, local_pt)
     if moved then
         moved = false
         return
     end
-    stop()
-    leaving, on_done, left = false, nil, 0
+    stop(local_pt)
+    left = 0
     if button == "right" then
         asleep:set(false)
         chatter()
@@ -547,23 +599,23 @@ local function poke(_, button)
     if pokes >= 4 then
         pokes = 0
         asleep:set(false)
-        speak("STOP POKING ME", 2200)
+        speak("STOP POKING ME")
         return play("jelly")
     end
     if asleep:get() then
         asleep:set(false)
-        speak("I was dreaming of fish!", 2200)
+        speak("I was dreaming of fish!")
         return play("wake")
     end
-    if math.random() < 0.5 then speak(POKE_LINES[math.random(#POKE_LINES)], 1500) end
+    if math.random() < 0.5 then speak(POKE_LINES[math.random(#POKE_LINES)]) end
     play("giggle")
 end
 
-local function spin_up()
+local function spin_up(_, _, local_pt)
     asleep:set(false)
-    stop()
-    leaving, on_done, left = false, nil, 0
-    speak("wheee!", 1800)
+    stop(local_pt)
+    left = 0
+    speak("wheee!")
     play("spin")
 end
 
@@ -571,7 +623,7 @@ end
 local function tickle()
     if antic:get() ~= "" or asleep:get() then return end
     left = 0
-    speak("hehe, stop!", 1800)
+    speak("hehe, stop!")
     play("jelly")
 end
 
@@ -798,31 +850,38 @@ local function zzz(content, size, wait)
         opacity = 0,
         hittable = false,
         animate = {
-            translate = { duration = 2400, easing = "out_sine", loops = 5, delay = wait, keyframes = { T(0, 0), T(14, -26) } },
-            opacity = { duration = 2400, loops = 5, delay = wait, keyframes = { 0, 1, 0 } },
+            translate = { duration = 2400, easing = "out_sine", loops = "infinite", delay = wait, keyframes = { T(0, 0), T(14, -26) } },
+            opacity = { duration = 2400, loops = "infinite", delay = wait, keyframes = { 0, 1, 0 } },
         },
     }
 end
 
+-- The z's, stars and "!" are built each time they show: a finished keyframe run never replays, and a
+-- hidden one freezes where it was.
 local sleeping = rect {
     width = W,
     height = H,
     hittable = false,
-    visible = asleep,
-    children = { zzz("z", 14, 0), zzz("Z", 18, 800), zzz("Z", 22, 1600) },
+    children = asleep:map(function(a) return a and { zzz("z", 14, 0), zzz("Z", 18, 800), zzz("Z", 22, 1600) } or {} end),
 }
 
-local alert = text {
-    content = "!",
-    font_size = 24,
-    font_weight = 800,
-    foreground = "#FF5C5C",
-    align_h = "center",
+local alert = rect {
+    width = W,
+    height = H,
     hittable = false,
-    visible = mood:map(function(m) return m == "surprised" end),
-    opacity = 1,
-    scale = 1,
-    animate = { scale = { spring = { stiffness = 600, damping = 12 }, from = 0.3 }, opacity = { duration = 100, from = 0 } },
+    children = mood:map(function(m)
+        if m ~= "surprised" then return {} end
+        return { text {
+            content = "!",
+            font_size = 24,
+            font_weight = 800,
+            foreground = "#FF5C5C",
+            align_h = "center",
+            opacity = 1,
+            scale = 1,
+            animate = { scale = { spring = { stiffness = 600, damping = 12 }, from = 0.3 }, opacity = { duration = 100, from = 0 } },
+        } }
+    end),
 }
 
 local function star(delay_ms, radius)
@@ -834,7 +893,7 @@ local function star(delay_ms, radius)
         hittable = false,
         translate = T(0, 0),
         animate = {
-            translate = { duration = 700, easing = "linear", loops = 3, delay = delay_ms, keyframes = {
+            translate = { duration = 700, easing = "linear", loops = "infinite", delay = delay_ms, keyframes = {
                 T(-radius, 0), T(0, -radius * 0.45), T(radius, 0), T(0, radius * 0.45), T(-radius, 0),
             } },
         },
@@ -847,8 +906,7 @@ local stars = rect {
     align_h = "center",
     margin = { top = 8 },
     hittable = false,
-    visible = mood:map(function(m) return m == "dizzy" end),
-    children = { star(0, 26), star(233, 26), star(466, 26) },
+    children = mood:map(function(m) return m == "dizzy" and { star(0, 26), star(233, 26), star(466, 26) } or {} end),
 }
 
 -- The mascot: spin (about the centre) > act (about the feet) > squash (grab and landing) -----------
@@ -912,23 +970,32 @@ local spin = rect {
     children = { act },
 }
 
--- Speech bubble: above the head, kept on screen, its tail pointing at the penguin -----------------
+-- Speech bubble: above the head, or below it near the top edge; kept on screen, its tail at Pip -----
 
-local function bubble_of(text_)
-    local bw, bh = math.max(44, #text_ * 6.8 + 24), 26
-    local shift = computed({ pos, screen }, function(p, sc)
-        if not sc then return 0 end
-        local left = p.x + (W - bw) / 2
-        return clamp(left, 6, math.max(6, sc.width - bw - 6)) - left
-    end)
+local BUBBLE_H = 26
+local ROOM = 40 -- above and below the box, for the bubble and its tail
+local SPEECH_W = 480 -- wider than any line, so the bubble sizes to its text without wrapping
+local bubble_box = geometry("mascot_bubble")
+
+-- The bubble's width is measured by layout, one pass after a new line appears.
+local shift = computed({ pos, screen, bubble_box }, function(p, sc, b)
+    if not (sc and b) then return 0 end
+    local left = p.x + (W - b.width) / 2
+    return clamp(left, 6, math.max(6, sc.width - b.width - 6)) - left
+end)
+local tail_x = computed({ shift, bubble_box }, function(d, b)
+    local reach = math.max(0, (b and b.width or 0) / 2 - 14)
+    return T(clamp(-d, -reach, reach), 0)
+end)
+local below = pos:map(function(p) return p.y < ROOM end)
+
+local function bubble_of(line, under, n)
     return rect {
-        id = "bubble",
-        width = bw,
-        height = bh + 8,
+        id = "bubble" .. n,
         align_h = "center",
-        margin = { top = -(bh + 10) },
+        align_v = under and "end" or "start",
         hittable = false,
-        origin = { x = 0.5, y = 1 },
+        origin = { x = 0.5, y = under and 0 or 1 },
         scale = 1,
         opacity = 1,
         translate = shift:map(function(d) return T(d, 0) end),
@@ -944,29 +1011,32 @@ local function bubble_of(text_)
                 rotate = 45,
                 background = "#FFFFFF",
                 align_h = "center",
-                align_v = "end",
-                margin = { bottom = 1 },
-                translate = shift:map(function(d) return T(clamp(-d, -(bw / 2 - 14), bw / 2 - 14), 0) end),
+                align_v = under and "start" or "end",
+                margin = under and { top = 1 } or { bottom = 1 },
+                translate = tail_x,
             },
             rect {
-                width = bw,
-                height = bh,
+                geometry = bubble_box,
+                height = BUBBLE_H,
+                padding = { left = 12, right = 12 },
+                margin = under and { top = 7 } or { bottom = 7 },
                 radius = 13,
                 background = "#FFFFFF",
                 shadows = { { color = "#00000040", blur = 10, offset = { y = 3 } } },
-                children = { text { content = text_, font_size = 12, font_weight = 600, foreground = "#1F2431", align_h = "center", align_v = "center" } },
+                children = { text { content = line, font_size = 12, font_weight = 600, foreground = "#1F2431", align_v = "center" } },
             },
         },
     }
 end
 
 local speech = rect {
-    width = W,
-    height = 1,
+    width = SPEECH_W,
+    height = H + 2 * ROOM,
+    translate = T((W - SPEECH_W) / 2, -ROOM),
     hittable = false,
-    children = computed({ bubble_on, say }, function(on, t)
+    children = computed({ bubble_on, say, below }, function(on, line, under)
         if not on then return {} end
-        return { bubble_of(t) }
+        return { bubble_of(line, under, lines_said) }
     end),
 }
 
@@ -985,6 +1055,7 @@ return {
         layer = "top",
         output = "active",
         anchor = { top = true, bottom = true, left = true, right = true },
+        visible = present,
         child = rect {
             width = "fill",
             height = "fill",
@@ -994,7 +1065,7 @@ return {
                 rect {
                     width = W,
                     height = H,
-                    visible = present,
+                    visible = rest:map(function(r) return r ~= false end),
                     translate = pos,
                     rotate = tilt,
                     animate = motion,
