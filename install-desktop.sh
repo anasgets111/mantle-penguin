@@ -11,9 +11,7 @@ if [ "${1:-}" = "--remove" ]; then
     echo "removed $file"
     exit 0
 fi
-for f in bin/mantle bin/mantle-renderer pip.sh; do
-    [ -x "$dir/$f" ] || { echo "missing $dir/$f" >&2; exit 1; }
-done
+[ -x "$dir/bin/mantle" ] || command -v mantle >/dev/null || { echo "install mantle first" >&2; exit 1; }
 mkdir -p "$apps"
 cat > "$file" <<DESKTOP
 [Desktop Entry]
